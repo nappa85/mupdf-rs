@@ -1,6 +1,6 @@
 use std::{
     convert::TryInto,
-    ffi::{c_int, c_void, CString},
+    ffi::{c_char, c_int, c_void, CStr, CString},
     io::Read,
     marker::PhantomData,
     ptr::{self, NonNull},
@@ -250,6 +250,11 @@ impl TextPage {
         Ok(res)
     }
 
+    /// The top-level blocks of the page.
+    ///
+    /// With [`TextPageFlags::COLLECT_STRUCTURE`] MuPDF emits [`TextBlockType::Struct`] blocks and
+    /// nests the text blocks that belong to the structure under them; those nested blocks are not
+    /// yielded here, reach them through [`TextBlock::structure`] and [`TextStruct::blocks`].
     pub fn blocks(&self) -> TextBlockIter<'_> {
         TextBlockIter {
             next: unsafe { (*self.as_ptr().cast_mut()).first_block },
@@ -511,12 +516,90 @@ from_enum! { c_int => c_int,
     }
 }
 
+from_enum! { c_int => c_int,
+    /// Standard PDF structure types (`fz_structure`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StructureType {
+        /// Not a valid structure type (`FZ_STRUCTURE_INVALID`).
+        Invalid = FZ_STRUCTURE_INVALID,
+        Document = FZ_STRUCTURE_DOCUMENT,
+        Part = FZ_STRUCTURE_PART,
+        Art = FZ_STRUCTURE_ART,
+        Sect = FZ_STRUCTURE_SECT,
+        Div = FZ_STRUCTURE_DIV,
+        Blockquote = FZ_STRUCTURE_BLOCKQUOTE,
+        Caption = FZ_STRUCTURE_CAPTION,
+        Toc = FZ_STRUCTURE_TOC,
+        Toci = FZ_STRUCTURE_TOCI,
+        Index = FZ_STRUCTURE_INDEX,
+        Nonstruct = FZ_STRUCTURE_NONSTRUCT,
+        Private = FZ_STRUCTURE_PRIVATE,
+        Documentfragment = FZ_STRUCTURE_DOCUMENTFRAGMENT,
+        Aside = FZ_STRUCTURE_ASIDE,
+        Title = FZ_STRUCTURE_TITLE,
+        Fenote = FZ_STRUCTURE_FENOTE,
+        Sub = FZ_STRUCTURE_SUB,
+        P = FZ_STRUCTURE_P,
+        H = FZ_STRUCTURE_H,
+        H1 = FZ_STRUCTURE_H1,
+        H2 = FZ_STRUCTURE_H2,
+        H3 = FZ_STRUCTURE_H3,
+        H4 = FZ_STRUCTURE_H4,
+        H5 = FZ_STRUCTURE_H5,
+        H6 = FZ_STRUCTURE_H6,
+        List = FZ_STRUCTURE_LIST,
+        Listitem = FZ_STRUCTURE_LISTITEM,
+        Label = FZ_STRUCTURE_LABEL,
+        Listbody = FZ_STRUCTURE_LISTBODY,
+        Table = FZ_STRUCTURE_TABLE,
+        Tr = FZ_STRUCTURE_TR,
+        Th = FZ_STRUCTURE_TH,
+        Td = FZ_STRUCTURE_TD,
+        Thead = FZ_STRUCTURE_THEAD,
+        Tbody = FZ_STRUCTURE_TBODY,
+        Tfoot = FZ_STRUCTURE_TFOOT,
+        Span = FZ_STRUCTURE_SPAN,
+        Quote = FZ_STRUCTURE_QUOTE,
+        Note = FZ_STRUCTURE_NOTE,
+        Reference = FZ_STRUCTURE_REFERENCE,
+        Bibentry = FZ_STRUCTURE_BIBENTRY,
+        Code = FZ_STRUCTURE_CODE,
+        Link = FZ_STRUCTURE_LINK,
+        Annot = FZ_STRUCTURE_ANNOT,
+        Em = FZ_STRUCTURE_EM,
+        Strong = FZ_STRUCTURE_STRONG,
+        Ruby = FZ_STRUCTURE_RUBY,
+        Rb = FZ_STRUCTURE_RB,
+        Rt = FZ_STRUCTURE_RT,
+        Rp = FZ_STRUCTURE_RP,
+        Warichu = FZ_STRUCTURE_WARICHU,
+        Wt = FZ_STRUCTURE_WT,
+        Wp = FZ_STRUCTURE_WP,
+        Figure = FZ_STRUCTURE_FIGURE,
+        Formula = FZ_STRUCTURE_FORMULA,
+        Form = FZ_STRUCTURE_FORM,
+        Artifact = FZ_STRUCTURE_ARTIFACT,
+    }
+}
+
+impl StructureType {
+    /// The standard structure name as reported by MuPDF (for example `"P"` or `"H1"`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        // SAFETY: `fz_structure_to_string` is a pure function returning a pointer to a static,
+        // NUL-terminated string for every input value.
+        unsafe { CStr::from_ptr(fz_structure_to_string(self.into())) }
+            .to_str()
+            .unwrap_or("Invalid")
+    }
+}
+
 /// A text block is a list of lines of text (typically a paragraph), or an image.
 pub struct TextBlock<'a> {
     inner: &'a fz_stext_block,
 }
 
-impl TextBlock<'_> {
+impl<'a> TextBlock<'a> {
     pub fn r#type(&self) -> TextBlockType {
         self.inner.type_.try_into().unwrap()
     }
@@ -525,7 +608,7 @@ impl TextBlock<'_> {
         self.inner.bbox.into()
     }
 
-    pub fn lines(&self) -> TextLineIter<'_> {
+    pub fn lines(&self) -> TextLineIter<'a> {
         unsafe {
             if self.inner.type_ == FZ_STEXT_BLOCK_TEXT as c_int {
                 return TextLineIter {
@@ -538,6 +621,19 @@ impl TextBlock<'_> {
             next: ptr::null_mut(),
             _marker: PhantomData,
         }
+    }
+
+    /// For [`TextBlockType::Struct`] blocks, the structure element this block stands for.
+    /// `None` for other block types or when MuPDF has no structure node for the block.
+    pub fn structure(&self) -> Option<TextStruct<'a>> {
+        if self.inner.type_ != FZ_STEXT_BLOCK_STRUCT as c_int {
+            return None;
+        }
+        // SAFETY: the block type is `FZ_STEXT_BLOCK_STRUCT`, so `u.s` is the active union member.
+        let down = unsafe { self.inner.u.s.down };
+        // SAFETY: a non-null `down` points to an `fz_stext_struct` owned by the text page, which
+        // outlives `'a`; the struct is never mutated after the page is built.
+        unsafe { down.as_ref() }.map(|inner| TextStruct { inner })
     }
 
     pub fn ctm(&self) -> Option<Matrix> {
@@ -580,13 +676,60 @@ impl<'a> Iterator for TextBlockIter<'a> {
     }
 }
 
+/// A node of the structure tree collected with [`TextPageFlags::COLLECT_STRUCTURE`].
+#[derive(Debug, Clone, Copy)]
+pub struct TextStruct<'a> {
+    inner: &'a fz_stext_struct,
+}
+
+impl<'a> TextStruct<'a> {
+    /// The standard structure type of this element.
+    pub fn standard(&self) -> StructureType {
+        self.inner
+            .standard
+            .try_into()
+            .unwrap_or(StructureType::Invalid)
+    }
+
+    /// The raw (possibly non-standard) role name from the document, if any.
+    pub fn raw(&self) -> Option<&'a str> {
+        // SAFETY: `raw` is a flexible array holding a NUL-terminated string that is allocated
+        // together with the struct (MuPDF always writes the terminator), so the address of the
+        // field is valid for reads up to and including the NUL for as long as the struct lives.
+        let ptr = ptr::addr_of!(self.inner.raw).cast::<c_char>();
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
+        (!s.is_empty()).then_some(s)
+    }
+
+    /// The `index` MuPDF stores on the block that holds this struct.
+    pub fn index(&self) -> i32 {
+        // SAFETY: `up` is either null or the `STRUCT` block that owns this node, whose `u.s` is
+        // the active union member; it lives as long as the text page.
+        unsafe { self.inner.up.as_ref() }.map_or(0, |b| unsafe { b.u.s.index })
+    }
+
+    /// The enclosing structure element, if any.
+    pub fn parent(&self) -> Option<TextStruct<'a>> {
+        // SAFETY: `parent` is null or points to another struct owned by the same text page.
+        unsafe { self.inner.parent.as_ref() }.map(|inner| TextStruct { inner })
+    }
+
+    /// The child blocks of this structure element.
+    pub fn blocks(&self) -> TextBlockIter<'a> {
+        TextBlockIter {
+            next: self.inner.first_block,
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// A text line is a list of characters that share a common baseline.
 #[derive(Debug)]
 pub struct TextLine<'a> {
     inner: &'a fz_stext_line,
 }
 
-impl TextLine<'_> {
+impl<'a> TextLine<'a> {
     pub fn bounds(&self) -> Rect {
         self.inner.bbox.into()
     }
@@ -595,7 +738,12 @@ impl TextLine<'_> {
         (self.inner.wmode as u32).try_into().unwrap()
     }
 
-    pub fn chars(&self) -> TextCharIter<'_> {
+    /// The normalized direction of the baseline.
+    pub fn dir(&self) -> Point {
+        self.inner.dir.into()
+    }
+
+    pub fn chars(&self) -> TextCharIter<'a> {
         TextCharIter {
             next: self.inner.first_char,
             _marker: PhantomData,
@@ -649,6 +797,11 @@ impl TextChar<'_> {
     /// Fill color, packed as `0xAARRGGBB` (sRGB).
     pub fn argb(&self) -> u32 {
         self.inner.argb
+    }
+
+    /// The bidi level: even for left-to-right, odd for right-to-left.
+    pub fn bidi(&self) -> u16 {
+        self.inner.bidi
     }
 
     pub fn flags(&self) -> TextCharFlags {
@@ -889,7 +1042,12 @@ mod test {
 
     /// Builds a minimal single-page PDF (Helvetica) from raw page content and extra catalog
     /// entries; `extra_objs` are numbered from 6 on.
-    fn synthetic_pdf(content: &str, catalog_extra: &str, page_extra: &str, extra_objs: &[&str]) -> Vec<u8> {
+    fn synthetic_pdf(
+        content: &str,
+        catalog_extra: &str,
+        page_extra: &str,
+        extra_objs: &[&str],
+    ) -> Vec<u8> {
         let mut objs: Vec<String> = vec![
             format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
@@ -897,7 +1055,10 @@ mod test {
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R \
                  /Resources << /Font << /F1 5 0 R >> >> {page_extra} >>"
             ),
-            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
         ];
         objs.extend(extra_objs.iter().map(|o| (*o).to_owned()));
@@ -946,7 +1107,10 @@ mod test {
             })
             .collect();
         let horiz = dirs.iter().find(|(t, _)| t == "Horizontal").unwrap().1;
-        assert!((horiz.x - 1.0).abs() < 1e-3 && horiz.y.abs() < 1e-3, "{horiz:?}");
+        assert!(
+            (horiz.x - 1.0).abs() < 1e-3 && horiz.y.abs() < 1e-3,
+            "{horiz:?}"
+        );
         let rot = dirs.iter().find(|(t, _)| t == "Rotated").unwrap().1;
         // A 90 degree counter-clockwise text matrix in PDF space points up on the page, which is
         // y = -1 in MuPDF's y-down page space.
@@ -973,10 +1137,11 @@ mod test {
             "/MarkInfo << /Marked true >> /StructTreeRoot 6 0 R",
             "/StructParents 0",
             &[
-                "<< /Type /StructTreeRoot /K [7 0 R 8 0 R] /ParentTree 9 0 R >>",
-                "<< /Type /StructElem /S /H1 /P 6 0 R /Pg 3 0 R /K 0 >>",
-                "<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K 1 >>",
-                "<< /Nums [0 [7 0 R 8 0 R]] >>",
+                "<< /Type /StructTreeRoot /K 7 0 R /ParentTree 10 0 R >>",
+                "<< /Type /StructElem /S /Document /P 6 0 R /K [8 0 R 9 0 R] >>",
+                "<< /Type /StructElem /S /H1 /P 7 0 R /Pg 3 0 R /K 0 >>",
+                "<< /Type /StructElem /S /P /P 7 0 R /Pg 3 0 R /K 1 >>",
+                "<< /Nums [0 [8 0 R 9 0 R]] >>",
             ],
         )
     }
@@ -1014,14 +1179,24 @@ mod test {
             }
         }
         walk(tp.blocks(), 0, &mut found);
-        let h1 = found.iter().find(|f| f.1 == StructureType::H1).expect("H1");
+        let h1 = found
+            .iter()
+            .find(|f| f.1 == StructureType::H1)
+            .unwrap_or_else(|| panic!("H1 missing: {found:?}"));
         assert_eq!(h1.2.as_deref(), Some("H1"));
         assert!(h1.3.iter().any(|t| t == "Title"), "{found:?}");
-        let p = found.iter().find(|f| f.1 == StructureType::P).expect("P");
+        let p = found
+            .iter()
+            .find(|f| f.1 == StructureType::P)
+            .unwrap_or_else(|| panic!("P missing: {found:?}"));
         assert_eq!(p.2.as_deref(), Some("P"));
         assert_eq!(p.1.name(), "P");
         assert!(p.3.iter().any(|t| t == "Body text"), "{found:?}");
-        assert!(h1.0 > 0 || p.0 > 0 || found.len() >= 2);
+        // Document wraps both, so the heading and the paragraph are nested one level down.
+        assert_eq!((h1.0, p.0), (1, 1), "{found:?}");
+        assert_eq!(found[0].1, StructureType::Document);
+        // The nested text is not repeated among the top-level blocks.
+        assert!(line_texts(tp.blocks()).is_empty());
     }
 
     #[test]
@@ -1036,7 +1211,14 @@ mod test {
             .collect();
         assert!(!top.is_empty());
         let first = top[0].structure().unwrap();
-        assert!(first.parent().is_none() || first.parent().is_some());
+        assert_eq!(first.standard(), crate::text_page::StructureType::Document);
+        assert!(first.parent().is_none());
+        let h1 = first
+            .blocks()
+            .filter_map(|b| b.structure())
+            .find(|s| s.raw() == Some("H1"))
+            .expect("H1 under Document");
+        assert_eq!(h1.parent().unwrap().standard(), first.standard());
         // every nested struct's parent chain ends at the root
         fn check(blocks: crate::text_page::TextBlockIter<'_>) {
             for b in blocks {
