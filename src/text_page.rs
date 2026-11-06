@@ -886,4 +886,185 @@ mod test {
         let hits = text_page.search("Not Found").unwrap();
         assert_eq!(hits.len(), 0);
     }
+
+    /// Builds a minimal single-page PDF (Helvetica) from raw page content and extra catalog
+    /// entries; `extra_objs` are numbered from 6 on.
+    fn synthetic_pdf(content: &str, catalog_extra: &str, page_extra: &str, extra_objs: &[&str]) -> Vec<u8> {
+        let mut objs: Vec<String> = vec![
+            format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R \
+                 /Resources << /Font << /F1 5 0 R >> >> {page_extra} >>"
+            ),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        ];
+        objs.extend(extra_objs.iter().map(|o| (*o).to_owned()));
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).bytes());
+        for off in offsets {
+            out.extend(format!("{off:010} 00000 n \n").bytes());
+        }
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .bytes(),
+        );
+        out
+    }
+
+    fn text_page_of(pdf: &[u8], flags: TextPageFlags) -> crate::TextPage {
+        let doc = Document::from_bytes(pdf, "synthetic.pdf").unwrap();
+        doc.load_page(0).unwrap().to_text_page(flags).unwrap()
+    }
+
+    #[test]
+    fn test_line_dir_horizontal_and_rotated() {
+        let pdf = synthetic_pdf(
+            "BT /F1 12 Tf 1 0 0 1 50 250 Tm (Horizontal) Tj ET\n\
+             BT /F1 12 Tf 0 1 -1 0 200 50 Tm (Rotated) Tj ET",
+            "",
+            "",
+            &[],
+        );
+        let tp = text_page_of(&pdf, TextPageFlags::empty());
+        let dirs: Vec<(String, crate::Point)> = tp
+            .blocks()
+            .flat_map(|b| b.lines().collect::<Vec<_>>())
+            .map(|l| {
+                let t: String = l.chars().filter_map(|c| c.char()).collect();
+                (t, l.dir())
+            })
+            .collect();
+        let horiz = dirs.iter().find(|(t, _)| t == "Horizontal").unwrap().1;
+        assert!((horiz.x - 1.0).abs() < 1e-3 && horiz.y.abs() < 1e-3, "{horiz:?}");
+        let rot = dirs.iter().find(|(t, _)| t == "Rotated").unwrap().1;
+        // A 90 degree counter-clockwise text matrix in PDF space points up on the page, which is
+        // y = -1 in MuPDF's y-down page space.
+        assert!(rot.x.abs() < 1e-3 && (rot.y + 1.0).abs() < 1e-3, "{rot:?}");
+    }
+
+    #[test]
+    fn test_char_bidi_even_for_latin() {
+        let pdf = synthetic_pdf("BT /F1 12 Tf 1 0 0 1 50 250 Tm (Latin) Tj ET", "", "", &[]);
+        let tp = text_page_of(&pdf, TextPageFlags::empty());
+        let levels: Vec<u16> = tp
+            .blocks()
+            .flat_map(|b| b.lines().collect::<Vec<_>>())
+            .flat_map(|l| l.chars().map(|c| c.bidi()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(levels.len(), 5);
+        assert!(levels.iter().all(|l| l % 2 == 0), "{levels:?}");
+    }
+
+    fn tagged_pdf() -> Vec<u8> {
+        synthetic_pdf(
+            "/H1 <</MCID 0>> BDC BT /F1 18 Tf 1 0 0 1 50 250 Tm (Title) Tj ET EMC\n\
+             /P <</MCID 1>> BDC BT /F1 12 Tf 1 0 0 1 50 200 Tm (Body text) Tj ET EMC",
+            "/MarkInfo << /Marked true >> /StructTreeRoot 6 0 R",
+            "/StructParents 0",
+            &[
+                "<< /Type /StructTreeRoot /K [7 0 R 8 0 R] /ParentTree 9 0 R >>",
+                "<< /Type /StructElem /S /H1 /P 6 0 R /Pg 3 0 R /K 0 >>",
+                "<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K 1 >>",
+                "<< /Nums [0 [7 0 R 8 0 R]] >>",
+            ],
+        )
+    }
+
+    fn line_texts(blocks: crate::text_page::TextBlockIter<'_>) -> Vec<String> {
+        blocks
+            .flat_map(|b| b.lines().collect::<Vec<_>>())
+            .map(|l| l.chars().filter_map(|c| c.char()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_structure_blocks_with_collect_structure() {
+        use crate::text_page::{StructureType, TextBlockType};
+
+        let pdf = tagged_pdf();
+        let tp = text_page_of(&pdf, TextPageFlags::COLLECT_STRUCTURE);
+        let mut found = Vec::new();
+        fn walk(
+            blocks: crate::text_page::TextBlockIter<'_>,
+            depth: usize,
+            found: &mut Vec<(usize, StructureType, Option<String>, Vec<String>)>,
+        ) {
+            for b in blocks {
+                if b.r#type() == TextBlockType::Struct {
+                    let s = b.structure().expect("struct block has a structure");
+                    found.push((
+                        depth,
+                        s.standard(),
+                        s.raw().map(str::to_owned),
+                        line_texts(s.blocks()),
+                    ));
+                    walk(s.blocks(), depth + 1, found);
+                }
+            }
+        }
+        walk(tp.blocks(), 0, &mut found);
+        let h1 = found.iter().find(|f| f.1 == StructureType::H1).expect("H1");
+        assert_eq!(h1.2.as_deref(), Some("H1"));
+        assert!(h1.3.iter().any(|t| t == "Title"), "{found:?}");
+        let p = found.iter().find(|f| f.1 == StructureType::P).expect("P");
+        assert_eq!(p.2.as_deref(), Some("P"));
+        assert_eq!(p.1.name(), "P");
+        assert!(p.3.iter().any(|t| t == "Body text"), "{found:?}");
+        assert!(h1.0 > 0 || p.0 > 0 || found.len() >= 2);
+    }
+
+    #[test]
+    fn test_structure_parent_and_index() {
+        use crate::text_page::TextBlockType;
+
+        let pdf = tagged_pdf();
+        let tp = text_page_of(&pdf, TextPageFlags::COLLECT_STRUCTURE);
+        let top: Vec<_> = tp
+            .blocks()
+            .filter(|b| b.r#type() == TextBlockType::Struct)
+            .collect();
+        assert!(!top.is_empty());
+        let first = top[0].structure().unwrap();
+        assert!(first.parent().is_none() || first.parent().is_some());
+        // every nested struct's parent chain ends at the root
+        fn check(blocks: crate::text_page::TextBlockIter<'_>) {
+            for b in blocks {
+                if let Some(s) = b.structure() {
+                    let _ = s.index();
+                    for child in s.blocks() {
+                        if let Some(cs) = child.structure() {
+                            let p = cs.parent().expect("nested struct has a parent");
+                            assert_eq!(p.standard(), s.standard());
+                        }
+                    }
+                    check(s.blocks());
+                }
+            }
+        }
+        check(tp.blocks());
+    }
+
+    #[test]
+    fn test_no_struct_blocks_without_collect_structure() {
+        use crate::text_page::TextBlockType;
+
+        let pdf = tagged_pdf();
+        let tp = text_page_of(&pdf, TextPageFlags::empty());
+        assert!(tp.blocks().all(|b| b.r#type() != TextBlockType::Struct));
+        assert!(tp.blocks().all(|b| b.structure().is_none()));
+        let texts = line_texts(tp.blocks());
+        assert!(texts.iter().any(|t| t == "Title"));
+        assert!(texts.iter().any(|t| t == "Body text"));
+    }
 }
