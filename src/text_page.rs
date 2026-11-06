@@ -1,6 +1,7 @@
 use std::{
     convert::TryInto,
     ffi::{c_char, c_int, c_void, CStr, CString},
+    fmt,
     io::Read,
     marker::PhantomData,
     ptr::{self, NonNull},
@@ -255,6 +256,8 @@ impl TextPage {
     /// With [`TextPageFlags::COLLECT_STRUCTURE`] MuPDF emits [`TextBlockType::Struct`] blocks and
     /// nests the text blocks that belong to the structure under them; those nested blocks are not
     /// yielded here, reach them through [`TextBlock::structure`] and [`TextStruct::blocks`].
+    /// MuPDF's own segmentation and classification can also produce Struct blocks without that
+    /// flag, so do not assume their absence.
     pub fn blocks(&self) -> TextBlockIter<'_> {
         TextBlockIter {
             next: unsafe { (*self.as_ptr().cast_mut()).first_block },
@@ -518,7 +521,7 @@ from_enum! { c_int => c_int,
 
 from_enum! { c_int => c_int,
     /// Standard PDF structure types (`fz_structure`).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum StructureType {
         /// Not a valid structure type (`FZ_STRUCTURE_INVALID`).
         Invalid = FZ_STRUCTURE_INVALID,
@@ -527,17 +530,17 @@ from_enum! { c_int => c_int,
         Art = FZ_STRUCTURE_ART,
         Sect = FZ_STRUCTURE_SECT,
         Div = FZ_STRUCTURE_DIV,
-        Blockquote = FZ_STRUCTURE_BLOCKQUOTE,
+        BlockQuote = FZ_STRUCTURE_BLOCKQUOTE,
         Caption = FZ_STRUCTURE_CAPTION,
-        Toc = FZ_STRUCTURE_TOC,
-        Toci = FZ_STRUCTURE_TOCI,
+        TOC = FZ_STRUCTURE_TOC,
+        TOCI = FZ_STRUCTURE_TOCI,
         Index = FZ_STRUCTURE_INDEX,
-        Nonstruct = FZ_STRUCTURE_NONSTRUCT,
+        NonStruct = FZ_STRUCTURE_NONSTRUCT,
         Private = FZ_STRUCTURE_PRIVATE,
-        Documentfragment = FZ_STRUCTURE_DOCUMENTFRAGMENT,
+        DocumentFragment = FZ_STRUCTURE_DOCUMENTFRAGMENT,
         Aside = FZ_STRUCTURE_ASIDE,
         Title = FZ_STRUCTURE_TITLE,
-        Fenote = FZ_STRUCTURE_FENOTE,
+        FENote = FZ_STRUCTURE_FENOTE,
         Sub = FZ_STRUCTURE_SUB,
         P = FZ_STRUCTURE_P,
         H = FZ_STRUCTURE_H,
@@ -548,33 +551,33 @@ from_enum! { c_int => c_int,
         H5 = FZ_STRUCTURE_H5,
         H6 = FZ_STRUCTURE_H6,
         List = FZ_STRUCTURE_LIST,
-        Listitem = FZ_STRUCTURE_LISTITEM,
+        ListItem = FZ_STRUCTURE_LISTITEM,
         Label = FZ_STRUCTURE_LABEL,
-        Listbody = FZ_STRUCTURE_LISTBODY,
+        ListBody = FZ_STRUCTURE_LISTBODY,
         Table = FZ_STRUCTURE_TABLE,
-        Tr = FZ_STRUCTURE_TR,
-        Th = FZ_STRUCTURE_TH,
-        Td = FZ_STRUCTURE_TD,
-        Thead = FZ_STRUCTURE_THEAD,
-        Tbody = FZ_STRUCTURE_TBODY,
-        Tfoot = FZ_STRUCTURE_TFOOT,
+        TR = FZ_STRUCTURE_TR,
+        TH = FZ_STRUCTURE_TH,
+        TD = FZ_STRUCTURE_TD,
+        THead = FZ_STRUCTURE_THEAD,
+        TBody = FZ_STRUCTURE_TBODY,
+        TFoot = FZ_STRUCTURE_TFOOT,
         Span = FZ_STRUCTURE_SPAN,
         Quote = FZ_STRUCTURE_QUOTE,
         Note = FZ_STRUCTURE_NOTE,
         Reference = FZ_STRUCTURE_REFERENCE,
-        Bibentry = FZ_STRUCTURE_BIBENTRY,
+        BibEntry = FZ_STRUCTURE_BIBENTRY,
         Code = FZ_STRUCTURE_CODE,
         Link = FZ_STRUCTURE_LINK,
         Annot = FZ_STRUCTURE_ANNOT,
         Em = FZ_STRUCTURE_EM,
         Strong = FZ_STRUCTURE_STRONG,
         Ruby = FZ_STRUCTURE_RUBY,
-        Rb = FZ_STRUCTURE_RB,
-        Rt = FZ_STRUCTURE_RT,
-        Rp = FZ_STRUCTURE_RP,
+        RB = FZ_STRUCTURE_RB,
+        RT = FZ_STRUCTURE_RT,
+        RP = FZ_STRUCTURE_RP,
         Warichu = FZ_STRUCTURE_WARICHU,
-        Wt = FZ_STRUCTURE_WT,
-        Wp = FZ_STRUCTURE_WP,
+        WT = FZ_STRUCTURE_WT,
+        WP = FZ_STRUCTURE_WP,
         Figure = FZ_STRUCTURE_FIGURE,
         Formula = FZ_STRUCTURE_FORMULA,
         Form = FZ_STRUCTURE_FORM,
@@ -631,9 +634,9 @@ impl<'a> TextBlock<'a> {
         }
         // SAFETY: the block type is `FZ_STEXT_BLOCK_STRUCT`, so `u.s` is the active union member.
         let down = unsafe { self.inner.u.s.down };
-        // SAFETY: a non-null `down` points to an `fz_stext_struct` owned by the text page, which
-        // outlives `'a`; the struct is never mutated after the page is built.
-        unsafe { down.as_ref() }.map(|inner| TextStruct { inner })
+        // A non-null `down` points to an `fz_stext_struct` owned by the text page, which outlives
+        // `'a`; the struct is never mutated after the page is built.
+        TextStruct::new(down)
     }
 
     pub fn ctm(&self) -> Option<Matrix> {
@@ -677,47 +680,81 @@ impl<'a> Iterator for TextBlockIter<'a> {
 }
 
 /// A node of the structure tree collected with [`TextPageFlags::COLLECT_STRUCTURE`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct TextStruct<'a> {
-    inner: &'a fz_stext_struct,
+    // Kept as a raw pointer (not a reference) because `raw` is a variable-length tail that a
+    // reference to the fixed-size `fz_stext_struct` would not cover.
+    inner: NonNull<fz_stext_struct>,
+    _marker: PhantomData<&'a fz_stext_struct>,
+}
+
+impl fmt::Debug for TextStruct<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextStruct")
+            .field("standard", &self.standard())
+            .field("raw", &self.raw_bytes().map(String::from_utf8_lossy))
+            .finish()
+    }
 }
 
 impl<'a> TextStruct<'a> {
+    fn new(ptr: *mut fz_stext_struct) -> Option<Self> {
+        NonNull::new(ptr).map(|inner| Self {
+            inner,
+            _marker: PhantomData,
+        })
+    }
+
     /// The standard structure type of this element.
     pub fn standard(&self) -> StructureType {
-        self.inner
-            .standard
+        // SAFETY: `inner` points to a struct owned by the text page, valid for `'a`; only fixed
+        // fields are read, through the raw pointer.
+        unsafe { (*self.inner.as_ptr()).standard }
             .try_into()
             .unwrap_or(StructureType::Invalid)
     }
 
-    /// The raw (possibly non-standard) role name from the document, if any.
-    pub fn raw(&self) -> Option<&'a str> {
-        // SAFETY: `raw` is a flexible array holding a NUL-terminated string that is allocated
-        // together with the struct (MuPDF always writes the terminator), so the address of the
-        // field is valid for reads up to and including the NUL for as long as the struct lives.
-        let ptr = ptr::addr_of!(self.inner.raw).cast::<c_char>();
-        let s = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
-        (!s.is_empty()).then_some(s)
+    /// The raw role name from the document as bytes (PDF names may hold arbitrary bytes), or
+    /// `None` if the element has no name.
+    pub fn raw_bytes(&self) -> Option<&'a [u8]> {
+        // SAFETY: `raw` is a flexible array holding a NUL-terminated string allocated together
+        // with the struct (MuPDF always writes the terminator). The pointer is derived from the
+        // raw struct pointer, so it keeps provenance over the whole allocation, and stays valid
+        // for `'a`.
+        let bytes = unsafe {
+            let ptr = ptr::addr_of!((*self.inner.as_ptr()).raw).cast::<c_char>();
+            CStr::from_ptr(ptr).to_bytes()
+        };
+        (!bytes.is_empty()).then_some(bytes)
     }
 
-    /// The `index` MuPDF stores on the block that holds this struct.
-    pub fn index(&self) -> i32 {
-        // SAFETY: `up` is either null or the `STRUCT` block that owns this node, whose `u.s` is
-        // the active union member; it lives as long as the text page.
-        unsafe { self.inner.up.as_ref() }.map_or(0, |b| unsafe { b.u.s.index })
+    /// The raw (possibly non-standard) role name from the document. `None` both when the
+    /// element has no name and when the name is not valid UTF-8; use [`Self::raw_bytes`] to
+    /// tell them apart.
+    pub fn raw(&self) -> Option<&'a str> {
+        std::str::from_utf8(self.raw_bytes()?).ok()
+    }
+
+    /// The position of this element in its parent's `/K` array (as computed by MuPDF), or
+    /// `None` if the struct has no owning block. MuPDF reports `-1` when it cannot locate the
+    /// element in its parent's kids.
+    pub fn index(&self) -> Option<i32> {
+        // SAFETY: `up` is null or the `STRUCT` block that owns this node, whose `u.s` is the
+        // active union member; it lives as long as the text page.
+        unsafe { (*self.inner.as_ptr()).up.as_ref().map(|b| b.u.s.index) }
     }
 
     /// The enclosing structure element, if any.
     pub fn parent(&self) -> Option<TextStruct<'a>> {
         // SAFETY: `parent` is null or points to another struct owned by the same text page.
-        unsafe { self.inner.parent.as_ref() }.map(|inner| TextStruct { inner })
+        Self::new(unsafe { (*self.inner.as_ptr()).parent })
     }
 
     /// The child blocks of this structure element.
     pub fn blocks(&self) -> TextBlockIter<'a> {
         TextBlockIter {
-            next: self.inner.first_block,
+            // SAFETY: fixed field read through the raw pointer of a live struct.
+            next: unsafe { (*self.inner.as_ptr()).first_block },
             _marker: PhantomData,
         }
     }
@@ -799,9 +836,16 @@ impl TextChar<'_> {
         self.inner.argb
     }
 
-    /// The bidi level: even for left-to-right, odd for right-to-left.
+    /// MuPDF's bidi marker for this char. Bit 0 is set for right-to-left; MuPDF stores
+    /// `level & 1` (0 or 1) and uses 3 for chars of a line that was reordered into visual
+    /// order. It is not a Unicode embedding level; prefer [`Self::is_rtl`].
     pub fn bidi(&self) -> u16 {
         self.inner.bidi
+    }
+
+    /// Whether the char is right-to-left (bit 0 of [`Self::bidi`]).
+    pub fn is_rtl(&self) -> bool {
+        self.inner.bidi & 1 == 1
     }
 
     pub fn flags(&self) -> TextCharFlags {
@@ -1146,9 +1190,11 @@ mod test {
             "/MarkInfo << /Marked true >> /StructTreeRoot 6 0 R",
             "/StructParents 0",
             &[
-                &format!("<< /Type /StructTreeRoot /K 7 0 R /ParentTree 10 0 R {root_extra} >>"),
+                format!("<< /Type /StructTreeRoot /K 7 0 R /ParentTree 10 0 R {root_extra} >>")
+                    .as_str(),
                 "<< /Type /StructElem /S /Document /P 6 0 R /K [8 0 R 9 0 R] >>",
-                &format!("<< /Type /StructElem /S /{heading_role} /P 7 0 R /Pg 3 0 R /K 0 >>"),
+                format!("<< /Type /StructElem /S /{heading_role} /P 7 0 R /Pg 3 0 R /K 0 >>")
+                    .as_str(),
                 "<< /Type /StructElem /S /P /P 7 0 R /Pg 3 0 R /K 1 >>",
                 "<< /Nums [0 [8 0 R 9 0 R]] >>",
             ],
