@@ -737,7 +737,9 @@ impl<'a> TextStruct<'a> {
 
     /// The position of this element in its parent's `/K` array (as computed by MuPDF), or
     /// `None` if the struct has no owning block. MuPDF reports `-1` when it cannot locate the
-    /// element in its parent's kids.
+    /// element in its parent's kids. For struct blocks that MuPDF synthesizes or renumbers
+    /// during segmentation or classification, this is MuPDF's own sibling ordering key, not
+    /// necessarily a `/K` position.
     pub fn index(&self) -> Option<i32> {
         // SAFETY: `up` is null or the `STRUCT` block that owns this node, whose `u.s` is the
         // active union member; it lives as long as the text page.
@@ -837,8 +839,9 @@ impl TextChar<'_> {
     }
 
     /// MuPDF's bidi marker for this char. Bit 0 is set for right-to-left; MuPDF stores
-    /// `level & 1` (0 or 1) and uses 3 for chars of a line that was reordered into visual
-    /// order. It is not a Unicode embedding level; prefer [`Self::is_rtl`].
+    /// `level & 1` (0 or 1) and uses 3 for right-to-left chars it detected in visual order
+    /// (MuPDF then reverses such lines into logical order). It is not a Unicode embedding
+    /// level; prefer [`Self::is_rtl`].
     pub fn bidi(&self) -> u16 {
         self.inner.bidi
     }
