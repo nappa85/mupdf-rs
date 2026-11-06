@@ -1128,18 +1128,27 @@ mod test {
             .collect();
         assert_eq!(levels.len(), 5);
         assert!(levels.iter().all(|l| l % 2 == 0), "{levels:?}");
+        assert!(tp
+            .blocks()
+            .flat_map(|b| b.lines())
+            .flat_map(|l| l.chars())
+            .all(|c| !c.is_rtl()));
     }
 
     fn tagged_pdf() -> Vec<u8> {
+        tagged_pdf_with("H1", "")
+    }
+
+    fn tagged_pdf_with(heading_role: &str, root_extra: &str) -> Vec<u8> {
         synthetic_pdf(
             "/H1 <</MCID 0>> BDC BT /F1 18 Tf 1 0 0 1 50 250 Tm (Title) Tj ET EMC\n\
              /P <</MCID 1>> BDC BT /F1 12 Tf 1 0 0 1 50 200 Tm (Body text) Tj ET EMC",
             "/MarkInfo << /Marked true >> /StructTreeRoot 6 0 R",
             "/StructParents 0",
             &[
-                "<< /Type /StructTreeRoot /K 7 0 R /ParentTree 10 0 R >>",
+                &format!("<< /Type /StructTreeRoot /K 7 0 R /ParentTree 10 0 R {root_extra} >>"),
                 "<< /Type /StructElem /S /Document /P 6 0 R /K [8 0 R 9 0 R] >>",
-                "<< /Type /StructElem /S /H1 /P 7 0 R /Pg 3 0 R /K 0 >>",
+                &format!("<< /Type /StructElem /S /{heading_role} /P 7 0 R /Pg 3 0 R /K 0 >>"),
                 "<< /Type /StructElem /S /P /P 7 0 R /Pg 3 0 R /K 1 >>",
                 "<< /Nums [0 [8 0 R 9 0 R]] >>",
             ],
@@ -1219,6 +1228,14 @@ mod test {
             .find(|s| s.raw() == Some("H1"))
             .expect("H1 under Document");
         assert_eq!(h1.parent().unwrap().standard(), first.standard());
+        assert_eq!(h1.index(), Some(0));
+        let p = first
+            .blocks()
+            .filter_map(|b| b.structure())
+            .find(|s| s.raw() == Some("P"))
+            .expect("P under Document");
+        assert_eq!(p.index(), Some(1));
+        assert_eq!(p.raw_bytes(), Some(&b"P"[..]));
         // every nested struct's parent chain ends at the root
         fn check(blocks: crate::text_page::TextBlockIter<'_>) {
             for b in blocks {
@@ -1235,6 +1252,26 @@ mod test {
             }
         }
         check(tp.blocks());
+    }
+
+    #[test]
+    fn test_structure_role_map_custom_role() {
+        use crate::text_page::StructureType;
+
+        let pdf = tagged_pdf_with("MyHead", "/RoleMap << /MyHead /H1 >>");
+        let tp = text_page_of(&pdf, TextPageFlags::COLLECT_STRUCTURE);
+        let doc_struct = tp
+            .blocks()
+            .find_map(|b| b.structure())
+            .expect("Document struct");
+        let head = doc_struct
+            .blocks()
+            .filter_map(|b| b.structure())
+            .find(|s| s.raw() == Some("MyHead"))
+            .expect("custom role kept as raw name");
+        assert_eq!(head.standard(), StructureType::H1);
+        assert_eq!(head.standard().name(), "H1");
+        assert_ne!(head.raw(), Some(head.standard().name()));
     }
 
     #[test]
